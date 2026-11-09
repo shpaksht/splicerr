@@ -1469,27 +1469,6 @@ impl App {
     fn player_ui(&mut self, ctx: &Context) {
         TopBottomPanel::bottom("player").show(ctx, |ui| {
             ui.add_space(4.0);
-            if let Some(clip) = self.selection.as_ref().and_then(|s| s.clip.as_ref()) {
-                let progress = self.player.position(clip, self.prefs.repeat);
-                let (bar, response) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::click());
-                ui.painter()
-                    .rect_filled(bar, 2.0, ui.visuals().widgets.inactive.bg_fill);
-                let played = Rect::from_min_max(
-                    bar.min,
-                    pos2(bar.left() + bar.width() * progress, bar.bottom()),
-                );
-                ui.painter()
-                    .rect_filled(played, 2.0, ui.visuals().selection.stroke.color);
-                if response.clicked()
-                    && let Some(pointer) = response.interact_pointer_pos()
-                {
-                    self.play_at(
-                        (pointer.x - bar.left()) / bar.width(),
-                        !self.player.playing(),
-                    );
-                }
-            }
             ui.horizontal(|ui| {
                 if ui
                     .button("⏮")
