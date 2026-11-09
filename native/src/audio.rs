@@ -18,10 +18,7 @@ pub struct Clip {
 
 impl Clip {
     pub async fn fetch(catalog: &Catalog, sample: &Sample, trim_delay: bool) -> Result<Self> {
-        let url = sample
-            .preview()
-            .ok_or("This sample has no audio preview.")?;
-        let mut bytes = catalog.media(url, MAX_AUDIO_BYTES).await?;
+        let mut bytes = catalog.preview_media(sample, MAX_AUDIO_BYTES).await?;
         let duration = sample_duration(sample.duration);
         tokio::task::spawn_blocking(move || {
             let offset = unpack_preview(&mut bytes)?;

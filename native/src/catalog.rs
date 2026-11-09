@@ -1,6 +1,12 @@
+use lru::LruCache;
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const PAGE_SIZE: u32 = 50;
@@ -36,6 +42,13 @@ query SampleCatalog($query: String, $tags: [ID], $key: String, $mode: String,
     tag_summary { tag { uuid label } }
     pagination_metadata { currentPage totalPages }
     response_metadata { records }
+  }
+}
+"#;
+const PREVIEW_LOOKUP: &str = r#"
+query SamplePreview($id: GUID!) {
+  asset(uuid: $id, legacy: {type: sample, searchCatalog: true}) {
+    ... on SampleAsset { uuid name files { asset_file_type_slug url } }
   }
 }
 "#;
@@ -204,17 +217,25 @@ impl SearchPage {
 }
 
 #[derive(Clone)]
-pub struct Catalog(reqwest::Client);
+pub struct Catalog {
+    http: reqwest::Client,
+    refreshed_previews: Arc<Mutex<LruCache<String, String>>>,
+}
 
 impl Catalog {
     pub fn new() -> Result<Self> {
-        reqwest::Client::builder()
+        let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map(Self)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            http,
+            refreshed_previews: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(128).unwrap(),
+            ))),
+        })
     }
 
     pub async fn search(&self, filters: &Filters, page: u32) -> Result<SearchPage> {
@@ -285,7 +306,7 @@ impl Catalog {
         }
 
         let response = self
-            .0
+            .http
             .post(GRAPHQL)
             .header("Accept", "application/json")
             .header("Origin", "https://splice.com")
@@ -317,8 +338,53 @@ impl Catalog {
             .unwrap_or_else(|| "Splice returned no usable catalog data.".into()))
     }
 
+    pub async fn preview_media(&self, sample: &Sample, limit: usize) -> Result<Vec<u8>> {
+        let cached = self
+            .refreshed_previews
+            .lock()
+            .unwrap()
+            .get(&sample.uuid)
+            .cloned();
+        let url = cached
+            .as_deref()
+            .or_else(|| sample.preview())
+            .ok_or("This sample has no audio preview.")?;
+        let response = self.request_media(url).await?;
+        if !preview_link_needs_refresh(response.status(), response.url()) {
+            return read_media(response, limit).await;
+        }
+        drop(response);
+
+        let fresh_url = self.lookup_preview_url(&sample.uuid).await?;
+        let bytes = self.media(&fresh_url, limit).await?;
+        self.refreshed_previews
+            .lock()
+            .unwrap()
+            .put(sample.uuid.clone(), fresh_url);
+        Ok(bytes)
+    }
+
+    async fn lookup_preview_url(&self, uuid: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Data {
+            asset: Option<Sample>,
+        }
+        let response: Data = self.graphql(PREVIEW_LOOKUP, json!({ "id": uuid })).await?;
+        response
+            .asset
+            .as_ref()
+            .filter(|asset| asset.uuid == uuid)
+            .and_then(Sample::preview)
+            .map(str::to_owned)
+            .ok_or_else(|| "Splice could not refresh the audio preview for this sample.".into())
+    }
+
     pub async fn media(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let url = reqwest::Url::parse(url).map_err(|_| "Invalid media URL.".to_string())?;
+        read_media(self.request_media(url).await?, limit).await
+    }
+
+    async fn request_media(&self, url: &str) -> Result<reqwest::Response> {
+        let url = Url::parse(url).map_err(|_| "Invalid media URL.".to_string())?;
         let host = url.host_str().unwrap_or("");
         let allowed = host == "splice.com"
             || host.ends_with(".splice.com")
@@ -329,21 +395,30 @@ impl Catalog {
         if url.scheme() != "https" || url.port().is_some() || !allowed {
             return Err("Unsupported Splice media URL.".into());
         }
-        let response = self
-            .0
+        self.http
             .get(url)
             .header("Referer", "https://splice.com/")
             .send()
             .await
-            .map_err(network_error)?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "Splice media returned HTTP {}.",
-                response.status().as_u16()
-            ));
-        }
-        read_limited(response, limit).await
+            .map_err(network_error)
     }
+}
+
+fn preview_link_needs_refresh(status: StatusCode, url: &Url) -> bool {
+    matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN)
+        && url
+            .query_pairs()
+            .any(|(name, _)| matches!(name.as_ref(), "X-Amz-Signature" | "Signature"))
+}
+
+async fn read_media(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if !response.status().is_success() {
+        return Err(format!(
+            "Splice media returned HTTP {}.",
+            response.status().as_u16()
+        ));
+    }
+    read_limited(response, limit).await
 }
 
 fn optional(value: &str) -> Option<&str> {
@@ -385,4 +460,25 @@ async fn read_limited(mut response: reqwest::Response, limit: usize) -> Result<V
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_rejected_signed_preview_links_trigger_a_refresh() {
+        let signed = Url::parse(
+            "https://spliceproduction.s3.us-west-1.amazonaws.com/preview?X-Amz-Signature=example",
+        )
+        .unwrap();
+        let unsigned = Url::parse("https://spliceblob.splice.com/waveform").unwrap();
+        assert!(preview_link_needs_refresh(StatusCode::BAD_REQUEST, &signed));
+        assert!(preview_link_needs_refresh(StatusCode::FORBIDDEN, &signed));
+        assert!(!preview_link_needs_refresh(StatusCode::NOT_FOUND, &signed));
+        assert!(!preview_link_needs_refresh(
+            StatusCode::BAD_REQUEST,
+            &unsigned
+        ));
+    }
 }
