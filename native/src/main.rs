@@ -93,13 +93,15 @@ fn check_catalog() -> catalog::Result<()> {
         };
         let clip = clip?;
         let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let write_started = Instant::now();
         let exported = clip.export(temp.path(), sample, true)?;
+        let write_ms = write_started.elapsed().as_millis();
         let wav = hound::WavReader::open(exported).map_err(|e| e.to_string())?;
         if wav.duration() == 0 {
             return Err("Exported WAV is empty.".into());
         }
         println!(
-            "Preview: {} peaks, {}×{} cover, {:.2} s audio, {} Hz WAV",
+            "Preview: {} peaks, {}×{} cover, {:.2} s audio, {} Hz WAV written in {write_ms} ms",
             peaks.len(),
             cover.size[0],
             cover.size[1],

@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, Result, Sample};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
-    io::Cursor,
+    io::{BufWriter, Cursor},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -104,8 +104,8 @@ impl Clip {
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
-        let mut writer =
-            hound::WavWriter::new(temporary.as_file_mut(), spec).map_err(file_error)?;
+        let mut writer = hound::WavWriter::new(BufWriter::new(temporary.as_file_mut()), spec)
+            .map_err(file_error)?;
         for sample in &self.samples {
             writer
                 .write_sample((sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)

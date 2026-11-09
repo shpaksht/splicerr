@@ -2,7 +2,7 @@ use crate::{
     audio::{Clip, Player},
     catalog::{Catalog, Filters, PAGE_SIZE, Result, Sample, Tag},
     media::{self, ImageData},
-    sample_drag::{self, PreparedWav},
+    sample_drag,
 };
 use eframe::egui::*;
 use lru::LruCache;
@@ -15,10 +15,12 @@ use std::{
     sync::{Arc, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{runtime::Runtime, task::JoinHandle};
+use tokio::{runtime::Runtime, sync::watch, task::JoinHandle};
 
 const DEBOUNCE: Duration = Duration::from_millis(240);
 const MEDIA_CONCURRENCY: usize = 6;
+const PREVIEW_HOVER_DELAY: Duration = Duration::from_millis(120);
+const MAX_PREFETCH_DURATION_MS: u32 = 20_000;
 const ROW_HEIGHT: f32 = 58.0;
 const LIKES: &str = "Likes";
 const SORTS: &[(&str, &str)] = &[
@@ -34,13 +36,15 @@ const SORTS: &[(&str, &str)] = &[
 
 type Row = Arc<Sample>;
 type Job = JoinHandle<()>;
+type PreviewRequest = watch::Receiver<Option<Result<Arc<Clip>>>>;
+type ExportKey = (u64, String);
 
 enum Event {
     Search(u64, u32, Result<Page>),
     Suggest(u64, Vec<String>),
     Media(u64, MediaKey, Result<ImageData>),
-    Audio(u64, Result<Clip>),
-    Export((u64, String), Result<PathBuf>),
+    Audio(u64, Result<Arc<Clip>>),
+    Export(ExportKey, Result<PathBuf>),
 }
 
 struct Page {
@@ -256,9 +260,18 @@ fn cancel(job: &mut Option<Job>) {
     }
 }
 
-struct ExportJob {
-    file: Arc<PreparedWav>,
-    reveal: bool,
+enum WavExport {
+    Ready(PathBuf),
+    Preparing(ExportKey),
+}
+
+async fn await_preview(mut request: PreviewRequest) -> Result<Arc<Clip>> {
+    request
+        .wait_for(Option::is_some)
+        .await
+        .map_err(|_| "Preview loading was interrupted.".to_string())?
+        .clone()
+        .expect("wait_for returned a completed preview")
 }
 
 struct Selection {
@@ -292,8 +305,11 @@ pub struct App {
     audio_job: Option<Job>,
     audio_ticket: u64,
     drag_started: bool,
+    pending_drag: Option<ExportKey>,
+    hovered_sample: Option<(String, Instant)>,
+    cached_preview: Option<(String, PreviewRequest)>,
     export_revision: u64,
-    exports: HashMap<(u64, String), ExportJob>,
+    exports: HashMap<ExportKey, bool>,
     status: String,
     demo: bool,
 }
@@ -347,6 +363,9 @@ impl App {
             audio_job: None,
             audio_ticket: 0,
             drag_started: false,
+            pending_drag: None,
+            hovered_sample: None,
+            cached_preview: None,
             export_revision: 0,
             exports: HashMap::new(),
             status: String::new(),
@@ -359,6 +378,7 @@ impl App {
     fn queue_search(&mut self, debounced: bool, suggest: bool) {
         self.selected_collection = None;
         self.suppress_suggestions = !suggest;
+        self.hovered_sample = None;
         self.search
             .reset(Instant::now() + if debounced { DEBOUNCE } else { Duration::ZERO });
         self.worker.ctx.request_repaint();
@@ -406,7 +426,7 @@ impl App {
         }
     }
 
-    fn events(&mut self, ctx: &Context) {
+    fn events(&mut self, ctx: &Context, frame: &eframe::Frame) {
         for _ in 0..32 {
             let Ok(event) = self.rx.try_recv() else {
                 return;
@@ -455,7 +475,7 @@ impl App {
                     match result {
                         Ok(clip) => {
                             if let Some(selected) = &mut self.selection {
-                                selected.clip = Some(Arc::new(clip));
+                                selected.clip = Some(clip);
                                 let fraction = selected.fraction;
                                 self.play_at(fraction, false);
                             }
@@ -464,20 +484,25 @@ impl App {
                     }
                 }
                 Event::Export(key, result) => {
-                    let job = self.exports.remove(&key);
+                    let reveal = self.exports.remove(&key).unwrap_or(false);
+                    let continue_drag = self.pending_drag.as_ref() == Some(&key);
+                    if continue_drag {
+                        self.pending_drag = None;
+                    }
                     if key.0 != self.export_revision {
                         continue;
                     }
-                    match result {
-                        Ok(path) => {
-                            self.status = format!("WAV ready · {}", path.display());
-                            if job.is_some_and(|job| job.reveal)
-                                && let Err(error) = reveal_file(&path)
-                            {
-                                self.status = error;
-                            }
+                    let result = result.and_then(|path| {
+                        if continue_drag {
+                            sample_drag::start(frame, path)
+                        } else if reveal {
+                            reveal_file(&path)
+                        } else {
+                            Ok(())
                         }
-                        Err(error) => self.status = error,
+                    });
+                    if let Err(error) = result {
+                        self.status = error;
                     }
                 }
                 _ => {}
@@ -559,17 +584,79 @@ impl App {
         });
         self.audio_ticket += 1;
         let ticket = self.audio_ticket;
+        let request = self.request_preview(&row);
+        self.audio_job = Some(
+            self.worker
+                .spawn(async move { Event::Audio(ticket, await_preview(request).await) }),
+        );
+    }
+
+    fn request_preview(&mut self, row: &Row) -> PreviewRequest {
+        if let Some((id, request)) = &self.cached_preview
+            && id == &row.uuid
+            && !request.borrow().as_ref().is_some_and(Result::is_err)
+        {
+            return request.clone();
+        }
+        let (sender, request) = watch::channel(None);
         let catalog = self.worker.catalog.clone();
+        let row = row.clone();
         let trim = self.prefs.trim_delay;
         let demo = self.demo;
-        self.audio_job = Some(self.worker.spawn(async move {
-            let result = if demo {
-                Ok(Clip::demo())
-            } else {
-                Clip::fetch(&catalog, &row, trim).await
+        self.cached_preview = Some((row.uuid.clone(), request.clone()));
+        self.worker.runtime.spawn(async move {
+            let fetch = async {
+                if demo {
+                    Ok(Clip::demo())
+                } else {
+                    Clip::fetch(&catalog, &row, trim).await
+                }
             };
-            Event::Audio(ticket, result)
-        }));
+            tokio::select! {
+                _ = sender.closed() => {},
+                result = fetch => {
+                    let _ = sender.send(Some(result.map(Arc::new)));
+                }
+            }
+        });
+        request
+    }
+
+    fn prefetch_hovered_preview(&mut self, hovered: Option<&Row>, ctx: &Context) {
+        let Some(row) = hovered.filter(|row| {
+            !self.drag_started
+                && row
+                    .duration
+                    .is_some_and(|ms| ms <= MAX_PREFETCH_DURATION_MS)
+                && !self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selected| selected.row.uuid == row.uuid)
+        }) else {
+            self.hovered_sample = None;
+            return;
+        };
+        if self
+            .cached_preview
+            .as_ref()
+            .is_some_and(|(id, _)| id == &row.uuid)
+        {
+            return;
+        }
+        let now = Instant::now();
+        let deadline = match self.hovered_sample.as_ref() {
+            Some((id, deadline)) if id == &row.uuid => *deadline,
+            _ => {
+                let deadline = now + PREVIEW_HOVER_DELAY;
+                self.hovered_sample = Some((row.uuid.clone(), deadline));
+                deadline
+            }
+        };
+        if deadline > now {
+            ctx.request_repaint_after(deadline - now);
+        } else {
+            self.request_preview(row);
+        }
     }
 
     fn play_at(&mut self, fraction: f32, paused: bool) {
@@ -655,7 +742,8 @@ impl App {
         }
     }
 
-    fn prepare_wav(&mut self, row: &Row, reveal: bool) -> Result<Arc<PreparedWav>> {
+    fn prepare_wav(&mut self, row: &Row, reveal: bool) -> Result<WavExport> {
+        self.status.clear();
         let directory = PathBuf::from(self.prefs.directory.trim());
         if !directory.is_absolute() {
             return Err("Set an absolute export folder in Settings.".into());
@@ -667,60 +755,53 @@ impl App {
             if reveal {
                 reveal_file(&path)?;
             }
-            return Ok(Arc::new(PreparedWav::ready(path)));
+            return Ok(WavExport::Ready(path));
         }
 
         let key = (self.export_revision, row.uuid.clone());
-        if let Some(job) = self.exports.get_mut(&key) {
-            job.reveal |= reveal;
-            return Ok(job.file.clone());
+        if let Some(reveal_when_ready) = self.exports.get_mut(&key) {
+            *reveal_when_ready |= reveal;
+            return Ok(WavExport::Preparing(key));
         }
         if self.exports.len() >= 2 {
             return Err("Two WAV previews are being prepared. Try again when one finishes.".into());
         }
-        let catalog = self.worker.catalog.clone();
         let clip = self
             .selection
             .as_ref()
             .filter(|selected| selected.row.uuid == row.uuid)
             .and_then(|selected| selected.clip.clone());
+        let request = clip.is_none().then(|| self.request_preview(row));
         let task_key = key.clone();
-        let file = Arc::new(PreparedWav::default());
-        let task_file = file.clone();
         let row = row.clone();
-        let demo = self.demo;
-        self.status = format!("Preparing WAV · {}", row.filename());
         self.worker.spawn(async move {
             let result = async {
-                let clip = match clip {
-                    Some(clip) => clip,
-                    None if demo => Arc::new(Clip::demo()),
-                    None => Arc::new(Clip::fetch(&catalog, &row, trim).await?),
+                let clip = match request {
+                    Some(request) => await_preview(request).await?,
+                    None => clip.expect("the selected clip was already decoded"),
                 };
                 tokio::task::spawn_blocking(move || clip.export(&directory, &row, trim))
                     .await
                     .map_err(|_| "WAV export was interrupted.".to_string())?
             }
             .await;
-            task_file.finish(result.clone());
             Event::Export(task_key, result)
         });
-        self.exports.insert(
-            key,
-            ExportJob {
-                file: file.clone(),
-                reveal,
-            },
-        );
-        Ok(file)
+        self.exports.insert(key.clone(), reveal);
+        Ok(WavExport::Preparing(key))
     }
 
     fn start_sample_drag(&mut self, frame: &eframe::Frame, row: &Row) {
         self.advance_after_page = false;
-        if let Err(error) = self
-            .prepare_wav(row, false)
-            .and_then(|file| sample_drag::start(frame, file))
-        {
+        let result = match self.prepare_wav(row, false) {
+            Ok(WavExport::Ready(path)) => sample_drag::start(frame, path),
+            Ok(WavExport::Preparing(key)) => {
+                self.pending_drag = Some(key);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             self.status = error;
         }
     }
@@ -1048,6 +1129,7 @@ impl App {
                     });
                 }
                 self.request_visible_media(&[]);
+                self.prefetch_hovered_preview(None, ctx);
                 self.row_offset = 0.0;
                 return;
             }
@@ -1062,17 +1144,21 @@ impl App {
                 scroll = scroll.vertical_scroll_offset(offset);
             }
             let mut visible = Vec::new();
+            let mut hovered = None;
             let mut last = 0;
             let view = scroll.show_rows(ui, ROW_HEIGHT, count, |ui, range| {
                 last = range.end;
                 visible = self.rows()[range.clone()].to_vec();
                 for (i, row) in visible.iter().enumerate() {
-                    self.sample_row(ui, frame, row, range.start + i, &columns);
+                    if self.sample_row(ui, frame, row, range.start + i, &columns) {
+                        hovered = Some(row.clone());
+                    }
                 }
             });
             self.row_offset = view.state.offset.y;
             self.row_view_height = view.inner_rect.height();
             self.request_visible_media(&visible);
+            self.prefetch_hovered_preview(hovered.as_ref(), ctx);
             if browse
                 && self.search.pending.is_none()
                 && self.search.search.is_none()
@@ -1092,23 +1178,28 @@ impl App {
         row: &Row,
         index: usize,
         c: &Columns,
-    ) {
+    ) -> bool {
         let (rect, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
         let mut row_ui = ui.new_child(UiBuilder::new().id_salt(&row.uuid).max_rect(rect));
         let ui = &mut row_ui;
+        let hovered = ui.rect_contains_pointer(rect);
+        let waiting = self
+            .pending_drag
+            .as_ref()
+            .is_some_and(|(_, id)| id == &row.uuid);
         let response = ui.interact(rect, ui.id().with("preview"), Sense::click_and_drag());
         let active = self
             .selection
             .as_ref()
             .is_some_and(|s| s.row.uuid == row.uuid);
-        if active {
+        if active || waiting {
             ui.painter().rect_filled(
                 rect,
                 4.0,
                 ui.visuals().selection.bg_fill.gamma_multiply(0.62),
             );
-        } else if response.hovered() {
+        } else if hovered {
             ui.painter()
                 .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
         } else if index.is_multiple_of(2) {
@@ -1202,7 +1293,11 @@ impl App {
                 );
             }
         }
-        let response = response.on_hover_cursor(CursorIcon::PointingHand);
+        let response = response.on_hover_cursor(if waiting {
+            CursorIcon::Progress
+        } else {
+            CursorIcon::Grab
+        });
         if response.clicked() {
             let seek = response
                 .interact_pointer_pos()
@@ -1273,7 +1368,11 @@ impl App {
                 at(c.actions + 32.0, 13.0, 50.0, 29.0),
                 Button::new(if busy { "…" } else { "WAV" }).sense(Sense::drag()),
             )
-            .on_hover_cursor(CursorIcon::Grab)
+            .on_hover_cursor(if waiting {
+                CursorIcon::Progress
+            } else {
+                CursorIcon::Grab
+            })
             .on_hover_text("Drag WAV to your DAW");
         let like_rect = at(c.actions, 13.0, 31.0, 29.0);
         let menu_rect = at(c.actions + 83.0, 13.0, 26.0, 29.0);
@@ -1284,12 +1383,12 @@ impl App {
             };
             pointer.primary_down()
                 && rect.intersect(ui.clip_rect()).contains(origin)
+                && !like_rect.contains(origin)
+                && !menu_rect.contains(origin)
                 && (drag_handle.rect.contains(origin)
-                    || (!like_rect.contains(origin)
-                        && !menu_rect.contains(origin)
-                        && pointer
-                            .latest_pos()
-                            .is_some_and(|pos| pos.distance(origin) >= 6.0)))
+                    || pointer
+                        .latest_pos()
+                        .is_some_and(|pos| pos.distance(origin) >= 6.0))
         });
         if drag_from_row
             && !self.drag_started
@@ -1361,6 +1460,10 @@ impl App {
                 ui.label(RichText::new("Create a collection using +").weak());
             }
         });
+        hovered
+            && !self.settings_open
+            && self.collection_name.is_none()
+            && !Popup::is_any_open(ui.ctx())
     }
 
     fn player_ui(&mut self, ctx: &Context) {
@@ -1476,6 +1579,7 @@ impl App {
                         .changed()
                     {
                         self.export_revision += 1;
+                        self.cached_preview = None;
                         cancel(&mut self.audio_job);
                         self.audio_ticket += 1;
                         self.player.stop();
@@ -1525,12 +1629,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
-        self.events(ctx);
         if ctx.input(|i| {
             !i.pointer.primary_down() || i.pointer.button_pressed(PointerButton::Primary)
         }) {
             self.drag_started = false;
+            self.pending_drag = None;
+        } else if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pending_drag = None;
         }
+        self.events(ctx, frame);
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
             self.selected_collection = None;
             self.search_focus = true;

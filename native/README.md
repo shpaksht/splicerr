@@ -15,7 +15,7 @@ The second command creates a locally signed `native/dist/Splicerr Native.app` fo
 
 - Search runs as you type. Enter submits immediately and Command+F returns focus to the search field. The key, mode, BPM and sound type filters sit beside search.
 - Click anywhere on a sample row to play or pause it. Click the waveform to audition from that point. Use the Up and Down keys or the previous and next buttons to audition adjacent samples. Space toggles playback when the search field is unfocused.
-- Drag a sample by its row or **WAV** handle to a DAW. A 16-bit WAV is prepared in the folder selected in Settings. For a slow first download, wait for the WAV to be ready and drag again. **Save WAV and show in Finder** is available in the row menu.
+- Drag a sample by its row or **WAV** handle to a DAW. A 16-bit WAV is prepared in the folder selected in Settings. If the preview is still downloading, keep the mouse button down. The drag starts when the file is ready. The WAV control shows preparation in the row. **Save WAV and show in Finder** is available in the row menu.
 - Like a sample or add it to a collection from the row menu. On first launch, the app reads compatible settings and saved sample records from the old macOS app when available.
 
 WAV exports contain preview audio. The native version focuses on searching and auditioning. Pitch shifting from some desktop builds is outside this version.
