@@ -1,3 +1,11 @@
+# Splicerr Native
+
+This fork adds a native Rust desktop client for fast Splice search and audio preview on macOS. Build, usage and verification steps are in the [native client guide](native/README.md).
+
+The upstream Svelte/Tauri implementation and its instructions follow.
+
+---
+
 # <img src="./src-tauri/icons/128x128.png" width="64"/> Splicerr
 
 **Splicerr** is an alternative frontend for the popular [Splice](https://splice.com/features/sounds) sample library. It does not require any authentication and contains all of the most important features of the regular desktop app (including drag-and-drop).

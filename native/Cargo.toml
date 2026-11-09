@@ -1,0 +1,24 @@
+[package]
+name = "splicerr-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+dirs = "6"
+eframe = { version = "0.32.3", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+hound = "3.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+lru = "0.16"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-mp3", "wav"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+drag = "2"
+
+[profile.release]
+strip = true
