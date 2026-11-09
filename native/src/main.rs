@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod catalog;
 mod media;
+mod sample_drag;
 
 use eframe::egui::{ViewportBuilder, vec2};
 use std::time::Instant;
@@ -92,7 +93,7 @@ fn check_catalog() -> catalog::Result<()> {
         };
         let clip = clip?;
         let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let exported = clip.export(temp.path(), sample)?;
+        let exported = clip.export(temp.path(), sample, true)?;
         let wav = hound::WavReader::open(exported).map_err(|e| e.to_string())?;
         if wav.duration() == 0 {
             return Err("Exported WAV is empty.".into());

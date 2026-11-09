@@ -91,20 +91,12 @@ impl Clip {
         )
     }
 
-    pub fn export(&self, directory: &Path, sample: &Sample) -> Result<PathBuf> {
-        let pack = sample
-            .pack()
-            .map(|p| p.name.as_str())
-            .unwrap_or("Splice previews");
-        let folder = directory.join(safe_name(pack));
-        std::fs::create_dir_all(&folder).map_err(file_error)?;
+    pub fn export(&self, directory: &Path, sample: &Sample, trim_delay: bool) -> Result<PathBuf> {
+        let path = preview_path(directory, sample, trim_delay);
+        let folder = path.parent().ok_or("Invalid WAV destination.")?;
+        std::fs::create_dir_all(folder).map_err(file_error)?;
         let folder = folder.canonicalize().map_err(file_error)?;
-        let name = Path::new(sample.filename())
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("preview");
-        let suffix: String = sample.uuid.chars().take(10).collect();
-        let path = folder.join(format!("{} - {}.wav", safe_name(name), safe_name(&suffix)));
+        let path = folder.join(path.file_name().ok_or("Invalid WAV filename.")?);
         let mut temporary = tempfile::NamedTempFile::new_in(&folder).map_err(file_error)?;
         let spec = hound::WavSpec {
             channels: self.channels,
@@ -120,9 +112,34 @@ impl Clip {
                 .map_err(file_error)?;
         }
         writer.finalize().map_err(file_error)?;
-        temporary.persist(&path).map_err(file_error)?;
-        Ok(path)
+        match temporary.persist_noclobber(&path) {
+            Ok(_) => Ok(path),
+            Err(error)
+                if error.error.kind() == std::io::ErrorKind::AlreadyExists && path.is_file() =>
+            {
+                Ok(path)
+            }
+            Err(error) => Err(file_error(error)),
+        }
     }
+}
+
+pub fn preview_path(directory: &Path, sample: &Sample, trim_delay: bool) -> PathBuf {
+    let pack = sample
+        .pack()
+        .map(|p| p.name.as_str())
+        .unwrap_or("Splice previews");
+    let name = Path::new(sample.filename())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("preview");
+    let suffix: String = sample.uuid.chars().take(10).collect();
+    let variant = if trim_delay { "" } else { " - untrimmed" };
+    directory.join(safe_name(pack)).join(format!(
+        "{} - {}{variant}.wav",
+        safe_name(name),
+        safe_name(&suffix)
+    ))
 }
 
 fn sample_duration(duration: Option<u32>) -> Option<Duration> {

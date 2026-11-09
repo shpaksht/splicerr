@@ -2,6 +2,7 @@ use crate::{
     audio::{Clip, Player},
     catalog::{Catalog, Filters, PAGE_SIZE, Result, Sample, Tag},
     media::{self, ImageData},
+    sample_drag::{self, PreparedWav},
 };
 use eframe::egui::*;
 use lru::LruCache;
@@ -39,7 +40,7 @@ enum Event {
     Suggest(u64, Vec<String>),
     Media(u64, MediaKey, Result<ImageData>),
     Audio(u64, Result<Clip>),
-    Export(String, Result<PathBuf>),
+    Export((u64, String), Result<PathBuf>),
 }
 
 struct Page {
@@ -255,6 +256,11 @@ fn cancel(job: &mut Option<Job>) {
     }
 }
 
+struct ExportJob {
+    file: Arc<PreparedWav>,
+    reveal: bool,
+}
+
 struct Selection {
     row: Row,
     clip: Option<Arc<Clip>>,
@@ -274,6 +280,10 @@ pub struct App {
     search_focus: bool,
     suppress_suggestions: bool,
     reset_scroll: bool,
+    reveal_row: Option<usize>,
+    row_offset: f32,
+    row_view_height: f32,
+    advance_after_page: bool,
     media_cache: LruCache<MediaKey, CachedMedia>,
     media_jobs: HashMap<MediaKey, (u64, Job)>,
     media_ticket: u64,
@@ -281,8 +291,9 @@ pub struct App {
     player: Player,
     audio_job: Option<Job>,
     audio_ticket: u64,
-    exports: HashMap<String, Job>,
-    exported: HashMap<String, PathBuf>,
+    drag_started: bool,
+    export_revision: u64,
+    exports: HashMap<(u64, String), ExportJob>,
     status: String,
     demo: bool,
 }
@@ -324,6 +335,10 @@ impl App {
             search_focus: true,
             suppress_suggestions: true,
             reset_scroll: true,
+            reveal_row: None,
+            row_offset: 0.0,
+            row_view_height: ROW_HEIGHT,
+            advance_after_page: false,
             media_cache: LruCache::new(NonZeroUsize::new(192).unwrap()),
             media_jobs: HashMap::new(),
             media_ticket: 0,
@@ -331,8 +346,9 @@ impl App {
             player: Player::new(),
             audio_job: None,
             audio_ticket: 0,
+            drag_started: false,
+            export_revision: 0,
             exports: HashMap::new(),
-            exported: HashMap::new(),
             status: String::new(),
             demo,
         };
@@ -400,7 +416,15 @@ impl App {
                     if ticket == self.search.ticket && page == 1 && reply.is_ok() {
                         self.reset_scroll = true;
                     }
+                    let advance = ticket == self.search.ticket
+                        && page > 1
+                        && reply.is_ok()
+                        && self.selected_collection.is_none()
+                        && self.advance_after_page;
                     self.search.apply(ticket, page, reply);
+                    if advance {
+                        self.next(1);
+                    }
                 }
                 Event::Suggest(ticket, values) if ticket == self.search.ticket => {
                     self.search.suggest = None;
@@ -439,12 +463,19 @@ impl App {
                         Err(error) => self.status = error,
                     }
                 }
-                Event::Export(id, result) => {
-                    self.exports.remove(&id);
+                Event::Export(key, result) => {
+                    let job = self.exports.remove(&key);
+                    if key.0 != self.export_revision {
+                        continue;
+                    }
                     match result {
                         Ok(path) => {
                             self.status = format!("WAV ready · {}", path.display());
-                            self.exported.insert(id, path);
+                            if job.is_some_and(|job| job.reveal)
+                                && let Err(error) = reveal_file(&path)
+                            {
+                                self.status = error;
+                            }
                         }
                         Err(error) => self.status = error,
                     }
@@ -568,16 +599,42 @@ impl App {
     }
 
     fn next(&mut self, direction: isize) {
+        self.advance_after_page = false;
         let rows = self.rows();
         let index = self
             .selection
             .as_ref()
             .and_then(|selected| rows.iter().position(|row| row.uuid == selected.row.uuid));
-        let target = index
-            .map(|index| index.checked_add_signed(direction))
-            .unwrap_or(Some(0));
-        if let Some(row) = target.and_then(|index| rows.get(index)).cloned() {
+        let target = index.map_or(Some(0), |index| index.checked_add_signed(direction));
+        if let Some((index, row)) = target.and_then(|i| rows.get(i).cloned().map(|row| (i, row))) {
+            self.reveal_row = Some(index);
             self.play_row(row, 0.0);
+        } else if direction == 1
+            && index.is_some()
+            && self.selected_collection.is_none()
+            && self.search.pending.is_none()
+            && self.search.next_page > 1
+            && self.search.error.is_none()
+        {
+            self.advance_after_page = true;
+            if self.search.search.is_none() {
+                self.start_page(self.search.next_page);
+            }
+        }
+    }
+
+    fn audition_row(&mut self, row: &Row, fraction: Option<f32>) {
+        self.advance_after_page = false;
+        if let Some(fraction) = fraction {
+            self.play_row(row.clone(), fraction);
+        } else if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.row.uuid == row.uuid)
+        {
+            self.toggle_play();
+        } else {
+            self.play_row(row.clone(), 0.0);
         }
     }
 
@@ -598,44 +655,74 @@ impl App {
         }
     }
 
-    fn queue_export(&mut self, row: Row) {
-        if self.demo || self.exports.contains_key(&row.uuid) {
-            return;
-        }
+    fn prepare_wav(&mut self, row: &Row, reveal: bool) -> Result<Arc<PreparedWav>> {
         let directory = PathBuf::from(self.prefs.directory.trim());
         if !directory.is_absolute() {
-            self.status = "Set an absolute export folder in Settings.".into();
-            return;
+            return Err("Set an absolute export folder in Settings.".into());
+        }
+        let trim = self.prefs.trim_delay;
+        let path = crate::audio::preview_path(&directory, row, trim);
+        if path.is_file() {
+            let path = path.canonicalize().map_err(|error| error.to_string())?;
+            if reveal {
+                reveal_file(&path)?;
+            }
+            return Ok(Arc::new(PreparedWav::ready(path)));
+        }
+
+        let key = (self.export_revision, row.uuid.clone());
+        if let Some(job) = self.exports.get_mut(&key) {
+            job.reveal |= reveal;
+            return Ok(job.file.clone());
         }
         if self.exports.len() >= 2 {
-            self.status =
-                "Two WAV previews are being prepared. Try again when one finishes.".into();
-            return;
+            return Err("Two WAV previews are being prepared. Try again when one finishes.".into());
         }
         let catalog = self.worker.catalog.clone();
-        let trim = self.prefs.trim_delay;
         let clip = self
             .selection
             .as_ref()
             .filter(|selected| selected.row.uuid == row.uuid)
             .and_then(|selected| selected.clip.clone());
-        let id = row.uuid.clone();
-        let task_id = id.clone();
+        let task_key = key.clone();
+        let file = Arc::new(PreparedWav::default());
+        let task_file = file.clone();
+        let row = row.clone();
+        let demo = self.demo;
         self.status = format!("Preparing WAV · {}", row.filename());
-        let job = self.worker.spawn(async move {
+        self.worker.spawn(async move {
             let result = async {
                 let clip = match clip {
                     Some(clip) => clip,
+                    None if demo => Arc::new(Clip::demo()),
                     None => Arc::new(Clip::fetch(&catalog, &row, trim).await?),
                 };
-                tokio::task::spawn_blocking(move || clip.export(&directory, &row))
+                tokio::task::spawn_blocking(move || clip.export(&directory, &row, trim))
                     .await
                     .map_err(|_| "WAV export was interrupted.".to_string())?
             }
             .await;
-            Event::Export(task_id, result)
+            task_file.finish(result.clone());
+            Event::Export(task_key, result)
         });
-        self.exports.insert(id, job);
+        self.exports.insert(
+            key,
+            ExportJob {
+                file: file.clone(),
+                reveal,
+            },
+        );
+        Ok(file)
+    }
+
+    fn start_sample_drag(&mut self, frame: &eframe::Frame, row: &Row) {
+        self.advance_after_page = false;
+        if let Err(error) = self
+            .prepare_wav(row, false)
+            .and_then(|file| sample_drag::start(frame, file))
+        {
+            self.status = error;
+        }
     }
 
     fn sidebar(&mut self, ctx: &Context) {
@@ -651,6 +738,7 @@ impl App {
                     .clicked()
                 {
                     self.selected_collection = None;
+                    self.reveal_row = None;
                     self.reset_scroll = true;
                 }
                 ui.add_space(18.0);
@@ -678,6 +766,8 @@ impl App {
                                 .clicked()
                             {
                                 self.selected_collection = Some(index);
+                                self.advance_after_page = false;
+                                self.reveal_row = None;
                                 self.reset_scroll = true;
                                 self.suppress_suggestions = true;
                             }
@@ -697,41 +787,86 @@ impl App {
         let mut changed = false;
         let mut submitted = false;
         let mut input_changed = false;
-        let mut show_suggestions = false;
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 110.0).max(170.0);
+            ui.spacing_mut().interact_size.y = 34.0;
+            let width = (ui.available_width() - 372.0).max(130.0);
             let search = ui.add_sized(
                 [width, 34.0],
                 TextEdit::singleline(&mut self.filters.term)
+                    .id(search_input_id())
                     .hint_text("Search samples…")
                     .desired_width(width)
                     .char_limit(240),
             );
-            if self.search_focus {
+            if std::mem::take(&mut self.search_focus) {
                 search.request_focus();
-                self.search_focus = false;
             }
             input_changed = search.changed();
-            show_suggestions = !self.suppress_suggestions;
-            submitted = (search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                || ui.add_sized([96.0, 34.0], Button::new("Search")).clicked();
-            if show_suggestions && ui.input(|i| i.key_pressed(Key::Escape)) {
+            submitted = search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
                 self.suppress_suggestions = true;
-                show_suggestions = false;
+                ui.memory_mut(|memory| memory.surrender_focus(search_input_id()));
             }
-        });
+            changed |= choices(
+                ui,
+                "key",
+                &mut self.filters.key,
+                &[
+                    ("", "Any key"),
+                    ("C", "C"),
+                    ("C#", "C#"),
+                    ("D", "D"),
+                    ("D#", "D#"),
+                    ("E", "E"),
+                    ("F", "F"),
+                    ("F#", "F#"),
+                    ("G", "G"),
+                    ("G#", "G#"),
+                    ("A", "A"),
+                    ("A#", "A#"),
+                    ("B", "B"),
+                ],
+            );
+            changed |= choices(
+                ui,
+                "mode",
+                &mut self.filters.mode,
+                &[("", "Any mode"), ("major", "Major"), ("minor", "Minor")],
+            );
 
-        if show_suggestions && !input_changed && !submitted && !self.search.suggestions.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                for term in &self.search.suggestions {
-                    if ui.small_button(term).clicked() {
-                        self.filters.term.clone_from(term);
-                        submitted = true;
+            let min = self.filters.min_bpm.trim();
+            let max = self.filters.max_bpm.trim();
+            let bpm_label = match (min, max) {
+                ("", "") => "Any BPM".into(),
+                (min, "") => format!("{min}+ BPM"),
+                ("", max) => format!("≤{max} BPM"),
+                (min, max) if min == max => format!("{min} BPM"),
+                (min, max) => format!("{min}–{max} BPM"),
+            };
+            ui.menu_button(bpm_label, |ui| {
+                ui.label("Tempo range");
+                ui.horizontal(|ui| {
+                    for (value, hint) in [
+                        (&mut self.filters.min_bpm, "Min"),
+                        (&mut self.filters.max_bpm, "Max"),
+                    ] {
+                        changed |= ui
+                            .add(
+                                TextEdit::singleline(value)
+                                    .hint_text(hint)
+                                    .desired_width(52.0)
+                                    .char_limit(3),
+                            )
+                            .changed();
                     }
+                });
+                if ui.button("Clear BPM").clicked() {
+                    self.filters.min_bpm.clear();
+                    self.filters.max_bpm.clear();
+                    changed = true;
+                    ui.close();
                 }
             });
-        }
-        ui.horizontal_wrapped(|ui| {
             changed |= choices(
                 ui,
                 "kind",
@@ -742,69 +877,22 @@ impl App {
                     ("oneshot", "One-shots"),
                 ],
             );
-            changed |= choices(
-                ui,
-                "key",
-                &mut self.filters.key,
-                &[
-                    ("", "Any key"),
-                    ("C", "C"),
-                    ("C#", "C♯"),
-                    ("D", "D"),
-                    ("D#", "D♯"),
-                    ("E", "E"),
-                    ("F", "F"),
-                    ("F#", "F♯"),
-                    ("G", "G"),
-                    ("G#", "G♯"),
-                    ("A", "A"),
-                    ("A#", "A♯"),
-                    ("B", "B"),
-                ],
-            );
-            changed |= choices(
-                ui,
-                "mode",
-                &mut self.filters.mode,
-                &[("", "Any mode"), ("major", "Major"), ("minor", "Minor")],
-            );
-            ui.label("BPM");
-            for (value, hint) in [
-                (&mut self.filters.min_bpm, "Min"),
-                (&mut self.filters.max_bpm, "Max"),
-            ] {
-                let bpm = ui.add(
-                    TextEdit::singleline(value)
-                        .hint_text(hint)
-                        .desired_width(44.0)
-                        .char_limit(5),
-                );
-                changed |= bpm.changed();
-            }
-            ui.separator();
-            changed |= choices(ui, "sort", &mut self.filters.sort, SORTS);
-            if ui
-                .small_button(if self.filters.ascending {
-                    "Asc"
-                } else {
-                    "Desc"
-                })
-                .on_hover_text("Reverse sort order")
-                .clicked()
-            {
-                self.filters.ascending = !self.filters.ascending;
-                changed = true;
-            }
-            if ui.small_button("Shuffle").clicked() {
-                self.filters.sort = "random";
-                self.filters.seed = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros()
-                    .to_string();
-                changed = true;
-            }
         });
+
+        if !self.suppress_suggestions
+            && !input_changed
+            && !submitted
+            && !self.search.suggestions.is_empty()
+        {
+            ui.horizontal_wrapped(|ui| {
+                for term in &self.search.suggestions {
+                    if ui.small_button(term).clicked() {
+                        self.filters.term.clone_from(term);
+                        submitted = true;
+                    }
+                }
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             if let Some((_, name)) = &self.filters.pack
                 && ui.small_button(format!("Pack: {name}  ×")).clicked()
@@ -847,6 +935,34 @@ impl App {
         }
     }
 
+    fn sort_ui(&mut self, ui: &mut Ui) {
+        let mut changed = choices(ui, "sort", &mut self.filters.sort, SORTS);
+        if ui
+            .small_button(if self.filters.ascending {
+                "Asc"
+            } else {
+                "Desc"
+            })
+            .on_hover_text("Reverse sort order")
+            .clicked()
+        {
+            self.filters.ascending = !self.filters.ascending;
+            changed = true;
+        }
+        if ui.small_button("Shuffle").clicked() {
+            self.filters.sort = "random";
+            self.filters.seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+                .to_string();
+            changed = true;
+        }
+        if changed {
+            self.queue_search(false, false);
+        }
+    }
+
     fn body(&mut self, ctx: &Context, frame: &eframe::Frame) {
         CentralPanel::default().show(ctx, |ui| {
             if self.selected_collection.is_none() {
@@ -878,6 +994,9 @@ impl App {
                             .small()
                             .color(ui.visuals().hyperlink_color),
                     );
+                }
+                if browse {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.sort_ui(ui));
                 }
             });
             if browse && let Some(error) = self.search.error.clone() {
@@ -929,21 +1048,30 @@ impl App {
                     });
                 }
                 self.request_visible_media(&[]);
+                self.row_offset = 0.0;
                 return;
             }
             let mut scroll = row_scroll();
             if std::mem::take(&mut self.reset_scroll) {
+                self.row_offset = 0.0;
                 scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            if let Some(index) = self.reveal_row.take() {
+                let pitch = ROW_HEIGHT + ui.spacing().item_spacing.y;
+                let offset = offset_to_reveal(self.row_offset, self.row_view_height, pitch, index);
+                scroll = scroll.vertical_scroll_offset(offset);
             }
             let mut visible = Vec::new();
             let mut last = 0;
-            scroll.show_rows(ui, ROW_HEIGHT, count, |ui, range| {
+            let view = scroll.show_rows(ui, ROW_HEIGHT, count, |ui, range| {
                 last = range.end;
                 visible = self.rows()[range.clone()].to_vec();
                 for (i, row) in visible.iter().enumerate() {
                     self.sample_row(ui, frame, row, range.start + i, &columns);
                 }
             });
+            self.row_offset = view.state.offset.y;
+            self.row_view_height = view.inner_rect.height();
             self.request_visible_media(&visible);
             if browse
                 && self.search.pending.is_none()
@@ -969,6 +1097,7 @@ impl App {
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
         let mut row_ui = ui.new_child(UiBuilder::new().id_salt(&row.uuid).max_rect(rect));
         let ui = &mut row_ui;
+        let response = ui.interact(rect, ui.id().with("preview"), Sense::click_and_drag());
         let active = self
             .selection
             .as_ref()
@@ -979,6 +1108,9 @@ impl App {
                 4.0,
                 ui.visuals().selection.bg_fill.gamma_multiply(0.62),
             );
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
         } else if index.is_multiple_of(2) {
             ui.painter()
                 .rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
@@ -1015,56 +1147,40 @@ impl App {
         } else {
             "▶"
         };
-        if ui
-            .put(
-                at(48.0, 12.0, 32.0, 32.0),
-                Button::new(play_label).frame(false),
-            )
-            .on_hover_text("Play or pause preview")
-            .clicked()
-        {
-            if active {
-                self.toggle_play();
-            } else {
-                self.play_row(row.clone(), 0.0);
-            }
-        }
+        ui.painter().text(
+            at(48.0, 12.0, 32.0, 32.0).center(),
+            Align2::CENTER_CENTER,
+            play_label,
+            FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
         let name_width = (c.wave - 95.0).max(75.0);
-        let title = place_left(
+        place_left(
             ui,
             at(86.0, 6.0, name_width, 24.0),
             Label::new(RichText::new(row.filename()).strong())
                 .truncate()
-                .sense(Sense::click()),
-        );
-        if title.on_hover_text(row.filename()).clicked() {
-            self.play_row(row.clone(), 0.0);
-        }
+                .selectable(false),
+        )
+        .on_hover_text(row.filename());
         let mut x = 86.0;
         for tag in row.tags.iter().take(4) {
             let width = (tag.label.chars().count() as f32 * 6.8 + 12.0).min(120.0);
             if x + width > c.wave - 5.0 {
                 break;
             }
-            if place_left(
+            place_left(
                 ui,
                 at(x, 32.0, width, 19.0),
                 Label::new(RichText::new(&tag.label).small().weak())
                     .truncate()
-                    .sense(Sense::click()),
-            )
-            .on_hover_text("Filter by tag")
-            .clicked()
-                && !self.filters.tags.iter().any(|other| other.uuid == tag.uuid)
-            {
-                self.filters.tags.push(tag.clone());
-                self.queue_search(false, false);
-            }
+                    .selectable(false),
+            );
             x += width + 4.0;
         }
 
-        if c.wave_width >= 45.0 {
-            let wave_rect = at(c.wave, 9.0, c.wave_width - 10.0, 38.0);
+        let wave_rect = (c.wave_width >= 45.0).then(|| at(c.wave, 9.0, c.wave_width - 10.0, 38.0));
+        if let Some(wave_rect) = wave_rect {
             let progress = self
                 .selection
                 .as_ref()
@@ -1085,16 +1201,15 @@ impl App {
                     ui.visuals().widgets.noninteractive.bg_stroke,
                 );
             }
-            let response =
-                ui.interact(wave_rect, ui.id().with((&row.uuid, "wave")), Sense::click());
-            if response.on_hover_text("Play from this point").clicked()
-                && let Some(pos) = ui.input(|i| i.pointer.interact_pos())
-            {
-                self.play_row(
-                    row.clone(),
-                    ((pos.x - wave_rect.left()) / wave_rect.width()).clamp(0.0, 1.0),
-                );
-            }
+        }
+        let response = response.on_hover_cursor(CursorIcon::PointingHand);
+        if response.clicked() {
+            let seek = response
+                .interact_pointer_pos()
+                .zip(wave_rect)
+                .filter(|(pos, wave)| wave.contains(*pos))
+                .map(|(pos, wave)| ((pos.x - wave.left()) / wave.width()).clamp(0.0, 1.0));
+            self.audition_row(row, seek);
         }
 
         for (value, x) in [
@@ -1150,83 +1265,102 @@ impl App {
         {
             self.toggle_like(row);
         }
-        let ready = self.exported.get(&row.uuid).cloned();
-        let busy = self.exports.contains_key(&row.uuid);
-        let enabled = !busy && !self.demo;
-        let label = if busy {
-            "…"
-        } else if ready.is_some() {
-            "Drag"
-        } else {
-            "WAV"
-        };
-        let action = ui
-            .scope_builder(
-                UiBuilder::new().max_rect(at(c.actions + 32.0, 13.0, 50.0, 29.0)),
-                |ui| ui.add_enabled(enabled, Button::new(label).sense(Sense::click_and_drag())),
+        let busy = self
+            .exports
+            .contains_key(&(self.export_revision, row.uuid.clone()));
+        let drag_handle = ui
+            .put(
+                at(c.actions + 32.0, 13.0, 50.0, 29.0),
+                Button::new(if busy { "…" } else { "WAV" }).sense(Sense::drag()),
             )
-            .inner;
-        let action = action.on_hover_text(if ready.is_some() {
-            "Drag to your DAW or click to reveal in Finder"
-        } else {
-            "Prepare a WAV from the Splice preview"
+            .on_hover_cursor(CursorIcon::Grab)
+            .on_hover_text("Drag WAV to your DAW");
+        let like_rect = at(c.actions, 13.0, 31.0, 29.0);
+        let menu_rect = at(c.actions + 83.0, 13.0, 26.0, 29.0);
+        let drag_from_row = ui.input(|input| {
+            let pointer = &input.pointer;
+            let Some(origin) = pointer.press_origin() else {
+                return false;
+            };
+            pointer.primary_down()
+                && rect.intersect(ui.clip_rect()).contains(origin)
+                && (drag_handle.rect.contains(origin)
+                    || (!like_rect.contains(origin)
+                        && !menu_rect.contains(origin)
+                        && pointer
+                            .latest_pos()
+                            .is_some_and(|pos| pos.distance(origin) >= 6.0)))
         });
-        if action.drag_started() || action.clicked() {
-            if let Some(path) = ready.filter(|path| path.is_file()) {
-                if action.drag_started() {
-                    if let Err(error) = drag_file(frame, path) {
-                        self.status = error;
-                    }
-                } else if let Err(error) = reveal_file(&path) {
+        if drag_from_row
+            && !self.drag_started
+            && !self.settings_open
+            && self.collection_name.is_none()
+            && !Popup::is_any_open(ui.ctx())
+        {
+            self.drag_started = true;
+            self.start_sample_drag(frame, row);
+        }
+        title_menu(ui, &row.uuid, menu_rect, |ui| {
+            if ui.button("Save WAV and show in Finder").clicked() {
+                if let Err(error) = self.prepare_wav(row, true) {
                     self.status = error;
                 }
-            } else {
-                self.exported.remove(&row.uuid);
-                self.queue_export(row.clone());
+                ui.close();
             }
-        }
-        title_menu(
-            ui,
-            &row.uuid,
-            at(c.actions + 83.0, 13.0, 26.0, 29.0),
-            |ui| {
-                if let Some(pack) = row.pack() {
-                    if ui.button("Browse this pack").clicked() {
-                        self.filters = Filters {
-                            pack: Some((pack.uuid.clone(), pack.name.clone())),
-                            ..Filters::default()
-                        };
-                        self.queue_search(false, false);
-                        ui.close();
-                    }
-                    if let Some(url) = pack_url(pack)
-                        && ui.button("Open pack on Splice").clicked()
-                    {
-                        ui.ctx().open_url(OpenUrl::new_tab(url));
-                        ui.close();
-                    }
-                }
-                for collection in self.prefs.collections.iter_mut().skip(1) {
-                    let position = collection.samples.iter().position(|s| s.uuid == row.uuid);
-                    let label = if position.is_some() {
-                        format!("Remove from {}", collection.name)
-                    } else {
-                        format!("Add to {}", collection.name)
+            if let Some(pack) = row.pack() {
+                if ui.button("Browse this pack").clicked() {
+                    self.filters = Filters {
+                        pack: Some((pack.uuid.clone(), pack.name.clone())),
+                        ..Filters::default()
                     };
-                    if ui.button(label).clicked() {
-                        if let Some(pos) = position {
-                            collection.samples.remove(pos);
-                        } else {
-                            collection.samples.push(row.clone());
+                    self.queue_search(false, false);
+                    ui.close();
+                }
+                if let Some(url) = pack_url(pack)
+                    && ui.button("Open pack on Splice").clicked()
+                {
+                    ui.ctx().open_url(OpenUrl::new_tab(url));
+                    ui.close();
+                }
+            }
+            if !row.tags.is_empty() {
+                ui.menu_button("Filter by tag", |ui| {
+                    for tag in &row.tags {
+                        if ui.button(&tag.label).clicked() {
+                            if !self
+                                .filters
+                                .tags
+                                .iter()
+                                .any(|active| active.uuid == tag.uuid)
+                            {
+                                self.filters.tags.push(tag.clone());
+                                self.queue_search(false, false);
+                            }
+                            ui.close();
                         }
-                        ui.close();
                     }
+                });
+            }
+            for collection in self.prefs.collections.iter_mut().skip(1) {
+                let position = collection.samples.iter().position(|s| s.uuid == row.uuid);
+                let label = if position.is_some() {
+                    format!("Remove from {}", collection.name)
+                } else {
+                    format!("Add to {}", collection.name)
+                };
+                if ui.button(label).clicked() {
+                    if let Some(pos) = position {
+                        collection.samples.remove(pos);
+                    } else {
+                        collection.samples.push(row.clone());
+                    }
+                    ui.close();
                 }
-                if self.prefs.collections.len() == 1 {
-                    ui.label(RichText::new("Create a collection using +").weak());
-                }
-            },
-        );
+            }
+            if self.prefs.collections.len() == 1 {
+                ui.label(RichText::new("Create a collection using +").weak());
+            }
+        });
     }
 
     fn player_ui(&mut self, ctx: &Context) {
@@ -1254,7 +1388,11 @@ impl App {
                 }
             }
             ui.horizontal(|ui| {
-                if ui.button("⏮").on_hover_text("Previous sample").clicked() {
+                if ui
+                    .button("⏮")
+                    .on_hover_text("Previous sample · Up")
+                    .clicked()
+                {
                     self.next(-1);
                 }
                 if ui
@@ -1264,7 +1402,7 @@ impl App {
                 {
                     self.toggle_play();
                 }
-                if ui.button("⏭").on_hover_text("Next sample").clicked() {
+                if ui.button("⏭").on_hover_text("Next sample · Down").clicked() {
                     self.next(1);
                 }
                 ui.separator();
@@ -1316,7 +1454,7 @@ impl App {
                         .add(TextEdit::singleline(&mut self.prefs.directory).desired_width(420.0))
                         .changed()
                     {
-                        self.exported.clear();
+                        self.export_revision += 1;
                     }
                     ui.label(
                         RichText::new("Exports use the audio preview available from Splice.")
@@ -1337,7 +1475,7 @@ impl App {
                         .checkbox(&mut self.prefs.trim_delay, "Trim legacy MP3 preview delay")
                         .changed()
                     {
-                        self.exported.clear();
+                        self.export_revision += 1;
                         cancel(&mut self.audio_job);
                         self.audio_ticket += 1;
                         self.player.stop();
@@ -1375,6 +1513,8 @@ impl App {
                 samples: vec![],
             });
             self.selected_collection = Some(self.prefs.collections.len() - 1);
+            self.advance_after_page = false;
+            self.reveal_row = None;
             self.reset_scroll = true;
         }
         if create || !open {
@@ -1386,14 +1526,29 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.events(ctx);
+        if ctx.input(|i| {
+            !i.pointer.primary_down() || i.pointer.button_pressed(PointerButton::Primary)
+        }) {
+            self.drag_started = false;
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
             self.selected_collection = None;
             self.search_focus = true;
         }
-        if !ctx.wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space))
-        {
-            self.toggle_play();
+        let search_editing = ctx.memory(|memory| memory.has_focus(search_input_id()));
+        if !self.settings_open && self.collection_name.is_none() && !Popup::is_any_open(ctx) {
+            let down = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
+            let up = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+            if (down || up) && !self.rows().is_empty() {
+                if search_editing {
+                    ctx.memory_mut(|memory| memory.surrender_focus(search_input_id()));
+                    self.suppress_suggestions = true;
+                }
+                self.next(if down { 1 } else { -1 });
+            }
+            if !search_editing && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space)) {
+                self.toggle_play();
+            }
         }
         self.start_due(ctx);
         self.player_ui(ctx);
@@ -1425,7 +1580,7 @@ fn choices(
         .map_or(choices[0].1, |(_, label)| *label);
     ComboBox::from_id_salt(id)
         .selected_text(text)
-        .width(98.0)
+        .width(if id == "sort" { 112.0 } else { 80.0 })
         .show_ui(ui, |ui| {
             for (value, label) in choices {
                 ui.selectable_value(selected, *value, *label);
@@ -1499,7 +1654,7 @@ impl Columns {
         let bpm = actions - 41.0;
         let key = bpm - 41.0;
         let time = key - 52.0;
-        let wave_width = ((time - 275.0) * 0.46).clamp(0.0, 250.0);
+        let wave_width = ((time - 212.0) * 0.5).clamp(0.0, 250.0);
         Self {
             wave: time - wave_width,
             wave_width,
@@ -1511,9 +1666,22 @@ impl Columns {
     }
 }
 
+fn search_input_id() -> Id {
+    Id::new("browse-search-input")
+}
+
+fn offset_to_reveal(offset: f32, height: f32, pitch: f32, row: usize) -> f32 {
+    let top = row as f32 * pitch;
+    offset.clamp((top + ROW_HEIGHT - height).min(top).max(0.0), top)
+}
+
 fn row_scroll() -> ScrollArea {
     ScrollArea::vertical()
         .id_salt("sample-rows")
+        .scroll_source(scroll_area::ScrollSource {
+            drag: false,
+            ..Default::default()
+        })
         .auto_shrink([false, false])
 }
 
@@ -1578,29 +1746,6 @@ fn demo_page(filters: &Filters, page: u32) -> Page {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn drag_file(frame: &eframe::Frame, path: PathBuf) -> Result<()> {
-    // A transparent PNG lets Finder or the DAW show its own drag feedback.
-    const ICON: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 98, 0, 2, 0, 0, 5, 0, 1,
-        13, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
-    drag::start_drag(
-        frame,
-        drag::DragItem::Files(vec![path]),
-        drag::Image::Raw(ICON.to_vec()),
-        |_, _| {},
-        Default::default(),
-    )
-    .map_err(|error| format!("Could not start dragging. {error}"))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn drag_file(_: &eframe::Frame, _: PathBuf) -> Result<()> {
-    Err("Use the exported WAV file from your file manager.".into())
-}
-
 fn reveal_file(path: &std::path::Path) -> Result<()> {
     let mut command = if cfg!(target_os = "macos") {
         let mut command = std::process::Command::new("open");
@@ -1655,6 +1800,15 @@ mod tests {
         );
         assert_eq!(search.next_page, 3);
         assert!(search.error.is_none());
+    }
+
+    #[test]
+    fn keyboard_navigation_scrolls_only_as_far_as_the_next_row_needs() {
+        let pitch = ROW_HEIGHT + 7.0;
+        assert_eq!(offset_to_reveal(0.0, 300.0, pitch, 2), 0.0);
+        assert_eq!(offset_to_reveal(0.0, 300.0, pitch, 5), 83.0);
+        assert_eq!(offset_to_reveal(160.0, 300.0, pitch, 1), pitch);
+        assert_eq!(offset_to_reveal(160.0, 300.0, pitch, 0), 0.0);
     }
 
     #[test]
